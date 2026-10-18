@@ -1,20 +1,21 @@
-<h1 align="center">gws</h1>
+<h1 align="center">gws (multi-account fork)</h1>
 
 **One CLI for all of Google Workspace — built for humans and AI agents.**<br>
 Drive, Gmail, Calendar, and every Workspace API. Zero boilerplate. Structured JSON output. 40+ agent skills included.
+
+> [!IMPORTANT]
+> **This is a fork of [googleworkspace/cli](https://github.com/googleworkspace/cli) that adds [multiple accounts](#multiple-accounts).**
+> Sign in to several Google accounts and pick one per command with `--account EMAIL`.
+> The fork has no prebuilt binaries, npm package or Homebrew formula. Those all install
+> upstream `gws`, which has no `--account` flag. Build this fork from source as shown in
+> [Installation](#installation).
 
 > [!NOTE]
 > This is **not** an officially supported Google product.
 
 <p>
-  <a href="https://www.npmjs.com/package/@googleworkspace/cli"><img src="https://img.shields.io/npm/v/@googleworkspace/cli" alt="npm version"></a>
-  <a href="https://github.com/googleworkspace/cli/blob/main/LICENSE"><img src="https://img.shields.io/github/license/googleworkspace/cli" alt="license"></a>
-  <a href="https://github.com/googleworkspace/cli/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/googleworkspace/cli/ci.yml?branch=main&label=CI" alt="CI status"></a>
-  <a href="https://www.npmjs.com/package/@googleworkspace/cli"><img src="https://img.shields.io/npm/unpacked-size/@googleworkspace/cli" alt="install size"></a>
+  <a href="https://github.com/erfnzdeh/gws-multi-account/blob/main/LICENSE"><img src="https://img.shields.io/github/license/erfnzdeh/gws-multi-account" alt="license"></a>
 </p>
-<br>
-
-⬇️ **[Download the latest release for your OS](https://github.com/googleworkspace/cli/releases)**
 
 `gws` doesn't ship a static list of commands. It reads Google's own [Discovery Service](https://developers.google.com/discovery) at runtime and builds its entire command surface dynamically. When Google Workspace adds an API endpoint or method, `gws` picks it up automatically.
 
@@ -26,6 +27,7 @@ Drive, Gmail, Calendar, and every Workspace API. Zero boilerplate. Structured JS
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Notes for AI agents](#notes-for-ai-agents)
 - [Why gws?](#why-gws)
 - [Authentication](#authentication)
 - [AI Agent Skills](#ai-agent-skills)
@@ -38,45 +40,147 @@ Drive, Gmail, Calendar, and every Workspace API. Zero boilerplate. Structured JS
 
 ## Prerequisites
 
-- **Node.js 18+** — for `npm install` (or download a pre-built binary from [GitHub Releases](https://github.com/googleworkspace/cli/releases))
-- **A Google Cloud project** — required for OAuth credentials. You can create one via the [Google Cloud Console](https://console.cloud.google.com/) or with the [`gcloud` CLI](https://cloud.google.com/sdk/docs/install) or with the `gws auth setup` command.
-- **A Google account** with access to Google Workspace
+- **A Rust toolchain** (stable). See [Installation](#installation).
+- **A Google Cloud project with your own OAuth client.** Create it in the [Google Cloud Console](https://console.cloud.google.com/), or let `gws auth setup` create it (needs the [`gcloud` CLI](https://cloud.google.com/sdk/docs/install)). Don't reuse someone else's `client_secret.json` or credentials.
+- **A Google account** with access to Google Workspace (a personal `@gmail.com` account works).
 
 ## Installation
 
-The recommended way to install `gws` is to download the pre-built binary for your OS and architecture from the **[GitHub Releases](https://github.com/googleworkspace/cli/releases)** page. Extract the archive and place the `gws` binary in your `$PATH`.
+### 1. Install Rust
 
-For convenience, you can also use `npm` to automate downloading the appropriate binary from GitHub Releases:
-
-```bash
-npm install -g @googleworkspace/cli
-```
-
-Or build from source:
+Use the official installer from [rustup.rs](https://rustup.rs/):
 
 ```bash
-cargo install --git https://github.com/googleworkspace/cli --locked
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-A Nix flake is also available at `github:googleworkspace/cli`
+Then open a new terminal, or run `. "$HOME/.cargo/env"`, so `cargo` and `~/.cargo/bin` are on your `PATH`.
+
+> [!NOTE]
+> Homebrew's `rustup` formula behaves differently: it has no `rustup-init`, you need to run
+> `rustup default stable` yourself, and its `cargo` lives in the keg-only
+> `$(brew --prefix rustup)/bin`, which is not on `PATH` by default. If you use it, add that
+> directory and `~/.cargo/bin` to your `PATH`.
+
+### 2. Build and install the fork
 
 ```bash
-nix run github:googleworkspace/cli
+cargo install --git https://github.com/erfnzdeh/gws-multi-account --locked
 ```
 
-On macOS and Linux, you can also install via [Homebrew](https://brew.sh/):
+This builds the `gws` binary and installs it to `~/.cargo/bin/gws`. The first build downloads
+about 300 crates and takes a few minutes. Don't add a package name after the URL: the repo
+has a single binary package (`google-workspace-cli`), and `gws` is the name of its binary, not
+of a package.
+
+To install somewhere else, add `--root`, for example `--root ~/.local` for `~/.local/bin/gws`.
+From a local clone, use `cargo install --path crates/google-workspace-cli --locked`.
+
+### 3. Make sure `gws` is the fork
 
 ```bash
-brew install googleworkspace-cli
+which -a gws
+gws --version
 ```
+
+The version line must end in `(my-gws)`, for example `gws 0.22.5 (my-gws)`. Upstream prints
+the same version number without that suffix, so the number alone tells you nothing. If
+`which -a gws` lists more than one path, the first one wins. Remove any upstream copies:
+
+```bash
+npm uninstall -g @googleworkspace/cli
+```
+
+```bash
+brew uninstall googleworkspace-cli
+```
+
+Also check scripts, cron jobs and launchd agents that call `gws` by an absolute path such as
+`/opt/homebrew/bin/gws`. They keep running the old binary, or break once it's removed.
+launchd and cron don't load your shell profile, so give them the full path to the fork.
+
+### Updating
+
+```bash
+cargo install --git https://github.com/erfnzdeh/gws-multi-account --locked --force
+```
+
+On macOS, a rebuilt binary may make Keychain ask again for access to the `gws-cli` entry (see
+[Troubleshooting](#macos-keychain-prompt-after-installing-or-updating)).
 
 ## Quick Start
 
 ```bash
-gws auth setup     # walks you through Google Cloud project config
-gws auth login     # subsequent OAuth login
-gws drive files list --params '{"pageSize": 5}'
+gws auth setup                                      # optional: creates a Cloud project + OAuth client (needs gcloud)
+gws auth login --account you@gmail.com -s gmail,drive,calendar,sheets
+gws auth login --account you@work.com -s gmail,drive  # add as many accounts as you like
+gws auth list                                       # JSON: accounts and the default
+gws --account you@work.com drive files list --params '{"pageSize": 5}'
 ```
+
+The first account you log in to becomes the default for reads. Change it with
+`gws auth default EMAIL`. If you already used upstream `gws`, import your existing sign-in
+first (see [Coming from upstream gws](#coming-from-upstream-gws)).
+
+## Notes for AI agents
+
+If you are an AI agent installing or using this CLI for someone, these are the mistakes
+earlier agents actually made. Read them before you start.
+
+**Installing**
+
+- Don't install `@googleworkspace/cli` from npm, the Homebrew formula, the upstream GitHub
+  releases or the upstream Nix flake. They are all upstream `gws` without multi-account
+  support. Use the `cargo install --git` command [above](#2-build-and-install-the-fork).
+- Check `gws --version` for `(my-gws)`, not just `which gws`. An old upstream binary earlier
+  on `PATH` is the most common problem.
+- Don't guess a package name for `cargo install`. The plain command above is correct.
+- Building and logging in need the user: the OAuth consent screen opens in their browser,
+  and macOS may show a Keychain prompt that only a person can approve. Tell them what to
+  expect, then wait.
+
+**Logging in**
+
+- Each person needs their own OAuth client in their own Google Cloud project. Never copy
+  another person's `client_secret.json`, `credentials.enc`, `.encryption_key` or token files.
+- With an unverified (testing mode) app, always pass `-s` with the services the user needs
+  (e.g. `-s gmail,drive,calendar,sheets`). The scope picker's `recommended` preset and
+  `--full` both go past Google's limit of about 25 scopes for unverified apps, and the consent
+  screen fails.
+- `gws auth login` listens on a new random `localhost` port each time. If you run it again,
+  only the newest URL works. Login finishes when the browser reaches the localhost page, so
+  the user must click through to the end.
+- Pass `--account EMAIL` to `gws auth login`. If the user picks a different Google account
+  in the browser, nothing is saved, and the error says so.
+- If `~/.config/gws` already holds an upstream sign-in, `--account` fails with
+  `noAccountRegistry`. Run `gws auth import --from ~/.config/gws` once, then continue.
+
+**Choosing the account**
+
+- Run `gws auth list` before anything else and use only the emails it returns. Never invent
+  or guess an address.
+- With two or more accounts, every write (send, create, update, delete, share) needs
+  `--account EMAIL`, or it fails with `"reason": "accountRequired"` and exit code 3. The
+  error lists the configured accounts. If the request doesn't say which account to use, ask
+  the user. Don't pick the default for them.
+- Reads without `--account` use the default account and print
+  `gws: using default account EMAIL` on stderr. A question like "how many unread emails do
+  I have?" may mean every account: run one command per account from `gws auth list`, or ask.
+- Use `--account`, not a separate `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` per account. That older
+  workaround needed a matching `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` for every directory and
+  was easy to get wrong.
+
+**Running commands**
+
+- stdout is JSON. Notes such as `Using keyring backend: keyring` and
+  `gws: using default account ...` go to stderr. Don't pipe `2>&1` into a JSON parser.
+- Don't send a write's output to `/dev/null`. Errors like `accountRequired` arrive on
+  stdout and stderr, and hiding them makes a failed write look like it worked.
+- After a write, read the result back. A write that reported an error may still have been
+  applied, so check the current state before retrying, or you may create duplicates.
+- Some writes have side effects. For example, `drive permissions create` emails the person
+  you share with unless you pass `"sendNotificationEmail": false` in `--params`.
+- Use `--dry-run` to check a request without sending it.
 
 ## Why gws?
 
@@ -255,27 +359,43 @@ Rules, designed so agents can't act as the wrong account by accident:
 
 Accounts live in `~/.config/gws/accounts.toml` and
 `~/.config/gws/accounts/<email>/` (credentials, token cache, timezone cache),
-all encrypted with the same key. A config directory without `accounts.toml`
-keeps working as a single-account directory, exactly as before. To move such a
-directory's account into the registry:
+all encrypted with the same key.
+
+### Coming from upstream gws
+
+The fork uses the same binary name, config directory (`~/.config/gws`), Keychain entry and
+environment variables as upstream, so an existing upstream sign-in keeps working as a
+single-account directory, exactly as before. Until you import it, `--account` fails with
+`noAccountRegistry`. To move it into the registry:
 
 ```bash
 gws auth import --from ~/.config/gws                          # this directory, in place
 gws auth import --from ~/.config/gws-work --keyring-backend file
 ```
 
+Importing in place renames the old top-level files to `*.imported-<timestamp>` instead of
+deleting them. Importing from another directory leaves that directory untouched. `import`
+refuses an account that is already configured. Log it out first if you really want to
+replace it.
+
 ## AI Agent Skills
 
 The repo ships 100+ Agent Skills (`SKILL.md` files) — one for every supported API, plus higher-level helpers for common workflows and 50 curated recipes for Gmail, Drive, Docs, Calendar, and Sheets. See the full [Skills Index](docs/skills.md) for the complete list.
 
+Install the skills from this fork, not from upstream. Only the fork's copies include the
+`gws-accounts` skill and the `--account` notes in `gws-shared`.
+
 ```bash
 # Install all skills at once
-npx skills add https://github.com/googleworkspace/cli
+npx skills add https://github.com/erfnzdeh/gws-multi-account
 
-# Or pick only what you need
-npx skills add https://github.com/googleworkspace/cli/tree/main/skills/gws-drive
-npx skills add https://github.com/googleworkspace/cli/tree/main/skills/gws-gmail
+# Or pick only what you need (keep gws-shared and gws-accounts)
+npx skills add https://github.com/erfnzdeh/gws-multi-account/tree/main/skills/gws-shared
+npx skills add https://github.com/erfnzdeh/gws-multi-account/tree/main/skills/gws-accounts
+npx skills add https://github.com/erfnzdeh/gws-multi-account/tree/main/skills/gws-gmail
 ```
+
+The skills don't install the CLI. Install it first (see [Installation](#installation)).
 
 <details>
 <summary>OpenClaw setup</summary>
@@ -288,7 +408,7 @@ ln -s $(pwd)/skills/gws-* ~/.openclaw/skills/
 cp -r skills/gws-drive skills/gws-gmail ~/.openclaw/skills/
 ```
 
-The `gws-shared` skill includes an `install` block so OpenClaw auto-installs the CLI via `npm` if `gws` isn't on PATH.
+Install the CLI yourself first. Don't let a skill manager auto-install `@googleworkspace/cli` from npm: that is upstream `gws`, without `--account`.
 
 </details>
 
@@ -302,7 +422,7 @@ The `gws-shared` skill includes an `install` block so OpenClaw auto-installs the
 
 2. Install the extension into the Gemini CLI:
    ```bash
-   gemini extensions install https://github.com/googleworkspace/cli
+   gemini extensions install https://github.com/erfnzdeh/gws-multi-account
    ```
 
 Installing this extension gives your Gemini CLI agent direct access to all `gws` commands and Google Workspace agent skills. Because `gws` handles its own authentication securely, you simply need to authenticate your terminal once prior to using the agent, and the extension will automatically inherit your credentials.
@@ -540,6 +660,65 @@ If a required Google API is not enabled for your GCP project, you will see a
 > [!TIP]
 > You can also run `gws auth setup` which walks you through enabling all required
 > APIs for your project automatically.
+
+### `--account` is not recognized
+
+You are running upstream `gws`, not this fork. Check `which -a gws` and `gws --version` (the
+fork prints `(my-gws)`), then remove or shadow the other copy. See
+[Make sure gws is the fork](#3-make-sure-gws-is-the-fork).
+
+### `accountRequired`
+
+The command writes data, two or more accounts are configured, and none was named. Rerun it
+with `--account EMAIL` (or set `GOOGLE_WORKSPACE_CLI_ACCOUNT`), using one of the emails in
+`error.accounts`. `--dry-run` never fails this way.
+
+### `noAccountRegistry`
+
+The config directory still holds a single upstream sign-in. Run
+`gws auth import --from ~/.config/gws`, then use `--account`. See
+[Coming from upstream gws](#coming-from-upstream-gws).
+
+### `Could not decrypt ... The file was left untouched`
+
+The credentials were written with a different keyring backend (`keyring` or `file`) than
+the one in use now. Set `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND` to match, or run
+`gws auth login --account EMAIL` to replace them. Unlike upstream, the fork never deletes a
+credentials file it can't decrypt.
+
+### macOS Keychain prompt after installing or updating
+
+The encryption key is stored in the login Keychain under the service `gws-cli`. A newly
+built binary isn't signed, so macOS may ask whether `gws` may use that entry. Click
+**Always Allow**. An agent running `gws` in the background waits until someone clicks it.
+
+The Keychain account name is `$USER`. If you run `gws` from launchd, cron or another
+environment, make sure `USER` is set to the same value, or it won't find the key.
+
+### 403 for a second person using your OAuth client
+
+`gws` bills API calls to the OAuth client's Cloud project. If someone else signs in with a
+client from your project, their calls fail with 403 until their account may use that
+project. Either have them create their own client (recommended), or grant them access:
+
+```bash
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member=user:them@example.com \
+  --role=roles/serviceusage.serviceUsageConsumer --condition=None
+```
+
+### Login stopped working after about a week
+
+OAuth apps in **Testing** mode get refresh tokens that expire after 7 days. Run
+`gws auth login --account EMAIL` again, or set the app's publishing status to
+**In production** on the OAuth consent screen (you'll still see the "unverified app" warning,
+which is fine for personal use).
+
+### `gws auth login` never finishes
+
+Each login listens on a new random `localhost` port. Use the URL from the most recent run and
+continue in the browser until it shows a localhost page saying "Success! You may now close this
+window."
 
 ## Development
 
