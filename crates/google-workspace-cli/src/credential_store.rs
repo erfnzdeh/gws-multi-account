@@ -340,6 +340,27 @@ fn resolve_key(
     }
 }
 
+/// Path of the `.encryption_key` file used by the file backend.
+#[cfg(not(test))]
+fn key_file_path() -> PathBuf {
+    crate::auth_commands::config_dir().join(".encryption_key")
+}
+
+/// Tests use a per-process temporary directory so that `cargo test` never
+/// writes a key into the developer's real config directory.
+#[cfg(test)]
+fn key_file_path() -> PathBuf {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("gws-test-key-")
+            .tempdir()
+            .expect("failed to create temp dir for test encryption key")
+    })
+    .path()
+    .join(".encryption_key")
+}
+
 /// Returns the encryption key, generating and persisting one if it doesn't exist.
 ///
 /// The key is cached in-process via `OnceLock` so it is only read from disk once.
@@ -363,7 +384,7 @@ fn get_or_create_key() -> anyhow::Result<[u8; 32]> {
         .or_else(|_| std::env::var("USERNAME"))
         .unwrap_or_else(|_| "unknown-user".to_string());
 
-    let key_file = crate::auth_commands::config_dir().join(".encryption_key");
+    let key_file = key_file_path();
     let provider = OsKeyring::new("gws-cli", &username);
 
     let key = resolve_key(backend, &provider, &key_file)?;
@@ -883,6 +904,17 @@ mod tests {
     fn get_or_create_key_produces_256_bits() {
         let key = get_or_create_key().unwrap();
         assert_eq!(key.len(), 32);
+    }
+
+    #[test]
+    fn test_key_file_stays_out_of_real_config_dir() {
+        get_or_create_key().unwrap();
+        let path = key_file_path();
+        assert!(path.starts_with(std::env::temp_dir()), "{}", path.display());
+        if let Some(home) = dirs::home_dir() {
+            assert!(!path.starts_with(home.join(".config")));
+        }
+        assert_eq!(read_key_file(&path), Some(get_or_create_key().unwrap()));
     }
 
     #[test]
