@@ -53,6 +53,7 @@ fn error_label(err: &GwsError) -> String {
         GwsError::Auth(_) => colorize("error[auth]:", "31"),   // red
         GwsError::Validation(_) => colorize("error[validation]:", "33"), // yellow
         GwsError::Discovery(_) => colorize("error[discovery]:", "31"), // red
+        GwsError::Account { .. } => colorize("error[account]:", "33"), // yellow
         GwsError::Other(_) => colorize("error:", "31"),        // red
     }
 }

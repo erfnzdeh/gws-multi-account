@@ -37,6 +37,19 @@ pub enum GwsError {
     #[error("{0}")]
     Discovery(String),
 
+    /// The command could not be tied to a configured account (missing,
+    /// unknown, or conflicting account selection).
+    #[error("{message}")]
+    Account {
+        /// Machine-readable reason, e.g. `accountRequired` or `unknownAccount`.
+        reason: String,
+        message: String,
+        /// Emails of all configured accounts, so callers can retry with one.
+        accounts: Vec<String>,
+        /// The default account, if one is set.
+        default: Option<String>,
+    },
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -60,6 +73,7 @@ impl GwsError {
             GwsError::Auth(_) => Self::EXIT_CODE_AUTH,
             GwsError::Validation(_) => Self::EXIT_CODE_VALIDATION,
             GwsError::Discovery(_) => Self::EXIT_CODE_DISCOVERY,
+            GwsError::Account { .. } => Self::EXIT_CODE_VALIDATION,
             GwsError::Other(_) => Self::EXIT_CODE_OTHER,
         }
     }
@@ -101,6 +115,20 @@ impl GwsError {
                     "code": 500,
                     "message": msg,
                     "reason": "discoveryError",
+                }
+            }),
+            GwsError::Account {
+                reason,
+                message,
+                accounts,
+                default,
+            } => json!({
+                "error": {
+                    "code": 400,
+                    "message": message,
+                    "reason": reason,
+                    "accounts": accounts,
+                    "default": default,
                 }
             }),
             GwsError::Other(e) => json!({
@@ -159,6 +187,23 @@ mod tests {
             GwsError::Other(anyhow::anyhow!("oops")).exit_code(),
             GwsError::EXIT_CODE_OTHER
         );
+    }
+
+    #[test]
+    fn test_account_error_json_lists_accounts() {
+        let err = GwsError::Account {
+            reason: "accountRequired".to_string(),
+            message: "Pass --account EMAIL".to_string(),
+            accounts: vec!["a@x.com".to_string(), "b@x.com".to_string()],
+            default: Some("a@x.com".to_string()),
+        };
+        assert_eq!(err.exit_code(), GwsError::EXIT_CODE_VALIDATION);
+        let json = err.to_json();
+        assert_eq!(json["error"]["code"], 400);
+        assert_eq!(json["error"]["reason"], "accountRequired");
+        assert_eq!(json["error"]["accounts"][1], "b@x.com");
+        assert_eq!(json["error"]["default"], "a@x.com");
+        assert_eq!(err.to_string(), "Pass --account EMAIL");
     }
 
     #[test]

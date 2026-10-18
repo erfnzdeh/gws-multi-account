@@ -53,8 +53,26 @@ pub struct ClientSecretFile {
 }
 
 /// Returns the path for the client secret config file.
+///
+/// A selected account may carry its own OAuth client (e.g. one created inside
+/// a Workspace org that blocks external apps); otherwise the shared client in
+/// the config directory is used.
 pub fn client_config_path() -> PathBuf {
-    crate::auth_commands::config_dir().join("client_secret.json")
+    if let Some(account) = crate::accounts::active_account() {
+        let own = account.dir.join(CLIENT_SECRET_FILE);
+        if own.exists() {
+            return own;
+        }
+    }
+    shared_client_config_path()
+}
+
+/// File name of an OAuth client configuration.
+pub const CLIENT_SECRET_FILE: &str = "client_secret.json";
+
+/// Path of the shared OAuth client in the config directory.
+pub fn shared_client_config_path() -> PathBuf {
+    crate::auth_commands::config_dir().join(CLIENT_SECRET_FILE)
 }
 
 /// Saves OAuth client configuration in the standard Google Cloud Console format.
@@ -75,7 +93,9 @@ pub fn save_client_config(
         },
     };
 
-    let path = client_config_path();
+    // Always the shared client: per-account clients are only installed by
+    // `gws auth login --client-secret`.
+    let path = shared_client_config_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }

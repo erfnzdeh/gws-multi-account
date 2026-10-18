@@ -19,6 +19,7 @@
 //! It supports deep schema validation, OAuth / Service Account authentication,
 //! interactive prompts, and integration with Model Armor.
 
+mod accounts;
 mod auth;
 pub(crate) mod auth_commands;
 mod client;
@@ -60,7 +61,9 @@ async fn main() {
 }
 
 async fn run() -> Result<(), GwsError> {
-    let args: Vec<String> = std::env::args().collect();
+    // `--account` may appear anywhere (even before the service name), so it
+    // is removed here before any other parsing.
+    let args = accounts::take_account_flag(std::env::args().collect())?;
 
     if args.len() < 2 {
         print_usage();
@@ -106,7 +109,7 @@ async fn run() -> Result<(), GwsError> {
     }
 
     if is_version_flag(&first_arg) {
-        println!("gws {}", env!("CARGO_PKG_VERSION"));
+        println!("gws {} (my-gws)", env!("CARGO_PKG_VERSION"));
         println!("This is not an officially supported Google product.");
         return Ok(());
     }
@@ -200,7 +203,12 @@ async fn run() -> Result<(), GwsError> {
 
     let sanitize_config = parse_sanitize_config(sanitize_template, &sanitize_mode)?;
 
+    let dry_run_requested = sub_args.iter().any(|a| a == "--dry-run");
+
     // Check if a helper wants to handle this command
+    if let Some(name) = matches.subcommand_name().filter(|n| n.starts_with('+')) {
+        accounts::select(accounts::classify_helper(name), dry_run_requested)?;
+    }
     if let Some(helper) = helpers::get_helper(&doc.name) {
         if helper.handle(&doc, &matches, &sanitize_config).await? {
             return Ok(());
@@ -252,6 +260,11 @@ async fn run() -> Result<(), GwsError> {
     };
 
     let dry_run = matched_args.get_flag("dry-run");
+
+    accounts::select(
+        accounts::classify_method(&method.http_method, &method.scopes),
+        dry_run,
+    )?;
 
     // Build pagination config from flags
     let pagination = parse_pagination_config(matched_args);
@@ -458,6 +471,7 @@ fn print_usage() {
     println!("    --upload-content-type <MIME>  MIME type of the uploaded file (auto-detected from extension if omitted)");
     println!("    --output <PATH>       Output file path for binary responses");
     println!("    --format <FMT>        Output format: json (default), table, yaml, csv");
+    println!("    --account <EMAIL>     Run as this configured account (see `gws auth list`)");
     println!("    --api-version <VER>   Override the API version (e.g., v2, v3)");
     println!("    --page-all            Auto-paginate, one JSON line per page (NDJSON)");
     println!("    --page-limit <N>      Max pages to fetch with --page-all (default: 10)");
@@ -477,6 +491,9 @@ fn print_usage() {
     println!("ENVIRONMENT:");
     println!("    GOOGLE_WORKSPACE_CLI_TOKEN               Pre-obtained OAuth2 access token (highest priority)");
     println!("    GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE    Path to OAuth credentials JSON file");
+    println!(
+        "    GOOGLE_WORKSPACE_CLI_ACCOUNT             Account to use when --account is not given"
+    );
     println!("    GOOGLE_WORKSPACE_CLI_CLIENT_ID           OAuth client ID (for gws auth login)");
     println!(
         "    GOOGLE_WORKSPACE_CLI_CLIENT_SECRET       OAuth client secret (for gws auth login)"

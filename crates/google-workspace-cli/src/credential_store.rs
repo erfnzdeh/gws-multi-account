@@ -381,8 +381,12 @@ fn get_or_create_key() -> anyhow::Result<[u8; 32]> {
 /// Encrypts plaintext bytes using AES-256-GCM with a machine-derived key.
 /// Returns nonce (12 bytes) || ciphertext.
 pub fn encrypt(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let key = get_or_create_key()?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    encrypt_with_key(&get_or_create_key()?, plaintext)
+}
+
+/// Encrypts with an explicit key, in the same format as [`encrypt`].
+pub fn encrypt_with_key(key: &[u8; 32], plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
 
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
@@ -398,12 +402,22 @@ pub fn encrypt(plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 /// Decrypts data produced by `encrypt()`.
 pub fn decrypt(data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    decrypt_with_key(&get_or_create_key()?, data)
+}
+
+/// Reads a base64 `.encryption_key` file, e.g. from another config directory
+/// that used the `file` backend.
+pub fn load_key_file(path: &std::path::Path) -> Option<[u8; 32]> {
+    read_key_file(path)
+}
+
+/// Decrypts data produced by `encrypt()` with an explicit key.
+pub fn decrypt_with_key(key: &[u8; 32], data: &[u8]) -> anyhow::Result<Vec<u8>> {
     if data.len() < 12 {
         anyhow::bail!("Encrypted data too short");
     }
 
-    let key = get_or_create_key()?;
-    let cipher = Aes256Gcm::new_from_slice(&key)
+    let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| anyhow::anyhow!("Failed to create cipher: {e}"))?;
 
     let nonce = Nonce::from_slice(&data[..12]);
@@ -422,14 +436,20 @@ pub fn active_backend_name() -> &'static str {
     KeyringBackend::from_env().as_str()
 }
 
-/// Returns the path for encrypted credentials.
+/// Returns the path for encrypted credentials (of the selected account, when
+/// an account registry is in use).
 pub fn encrypted_credentials_path() -> PathBuf {
-    crate::auth_commands::config_dir().join("credentials.enc")
+    crate::accounts::credential_dir().join("credentials.enc")
 }
 
 /// Saves credentials JSON to an encrypted file.
 pub fn save_encrypted(json: &str) -> anyhow::Result<PathBuf> {
-    let path = encrypted_credentials_path();
+    save_encrypted_to(&encrypted_credentials_path(), json)
+}
+
+/// Saves credentials JSON, encrypted, to `path`.
+pub fn save_encrypted_to(path: &std::path::Path, json: &str) -> anyhow::Result<PathBuf> {
+    let path = path.to_path_buf();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
         #[cfg(unix)]

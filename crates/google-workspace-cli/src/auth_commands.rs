@@ -72,9 +72,40 @@ async fn exchange_code_with_reqwest(
         .map_err(|e| GwsError::Auth(format!("Failed to parse token response: {e}")))
 }
 
-fn build_proxy_auth_url(client_id: &str, redirect_uri: &str, scopes: &[String]) -> String {
+/// Extra query parameters added to the OAuth consent URL.
+#[derive(Debug, Default, Clone)]
+struct AuthUrlExtras {
+    /// Pre-selects this Google account in the consent screen.
+    login_hint: Option<String>,
+    /// Incremental auth: the new grant also covers previously granted scopes.
+    include_granted_scopes: bool,
+}
+
+impl AuthUrlExtras {
+    fn apply(&self, url: &str) -> String {
+        let mut params = Vec::new();
+        if let Some(hint) = &self.login_hint {
+            params.push(format!("login_hint={}", urlencoding(hint)));
+        }
+        if self.include_granted_scopes {
+            params.push("include_granted_scopes=true".to_string());
+        }
+        if params.is_empty() {
+            return url.to_string();
+        }
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}{}", params.join("&"))
+    }
+}
+
+fn build_proxy_auth_url(
+    client_id: &str,
+    redirect_uri: &str,
+    scopes: &[String],
+    extras: &AuthUrlExtras,
+) -> String {
     let scopes_str = scopes.join(" ");
-    format!(
+    let url = format!(
         "https://accounts.google.com/o/oauth2/auth?\
          scope={}&\
          access_type=offline&\
@@ -85,7 +116,8 @@ fn build_proxy_auth_url(client_id: &str, redirect_uri: &str, scopes: &[String]) 
         urlencoding(&scopes_str),
         urlencoding(redirect_uri),
         urlencoding(client_id)
-    )
+    );
+    extras.apply(&url)
 }
 
 fn extract_authorization_code(request_line: &str) -> Result<String, GwsError> {
@@ -114,6 +146,7 @@ async fn login_with_proxy_support(
     client_id: &str,
     client_secret: &str,
     scopes: &[String],
+    extras: &AuthUrlExtras,
 ) -> Result<(String, String), GwsError> {
     // Start local server to receive OAuth callback
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -124,7 +157,7 @@ async fn login_with_proxy_support(
         .port();
     let redirect_uri = format!("http://localhost:{}", port);
 
-    let auth_url = build_proxy_auth_url(client_id, &redirect_uri, scopes);
+    let auth_url = build_proxy_auth_url(client_id, &redirect_uri, scopes, extras);
 
     println!("Open this URL in your browser to authenticate:\n");
     println!("  {}\n", auth_url);
@@ -183,6 +216,7 @@ async fn login_with_yup_oauth(
     client_id: &str,
     client_secret: &str,
     scopes: &[String],
+    extras: &AuthUrlExtras,
 ) -> Result<(String, String), GwsError> {
     let secret = yup_oauth2::ApplicationSecret {
         client_id: client_id.to_string(),
@@ -205,7 +239,9 @@ async fn login_with_yup_oauth(
             temp_path.clone(),
         )))
         .force_account_selection(true)
-        .flow_delegate(Box::new(CliFlowDelegate { login_hint: None }))
+        .flow_delegate(Box::new(CliFlowDelegate {
+            extras: extras.clone(),
+        }))
         .build()
         .await
         .map_err(|e| GwsError::Auth(format!("Failed to build authenticator: {e}")))?;
@@ -338,11 +374,11 @@ fn plain_credentials_path() -> PathBuf {
     if let Ok(path) = std::env::var("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE") {
         return PathBuf::from(path);
     }
-    config_dir().join("credentials.json")
+    crate::accounts::credential_dir().join("credentials.json")
 }
 
 fn token_cache_path() -> PathBuf {
-    config_dir().join("token_cache.json")
+    crate::accounts::credential_dir().join("token_cache.json")
 }
 
 /// Which scope set to use for login.
@@ -392,6 +428,25 @@ fn build_login_subcommand() -> clap::Command {
                 )
                 .value_name("services"),
         )
+        .arg(account_arg(
+            "Account to log in to. Pre-selects it in the browser and rejects a different one",
+        ))
+        .arg(
+            clap::Arg::new("client-secret")
+                .long("client-secret")
+                .help("OAuth client file to use for this account only (e.g. one created inside a Workspace org)")
+                .value_name("PATH"),
+        )
+}
+
+/// `--account` as documented on auth subcommands. The value itself is taken
+/// out of argv in `main` (see `accounts::take_account_flag`), so clap only
+/// uses this for help output.
+fn account_arg(help: &'static str) -> clap::Arg {
+    clap::Arg::new("account")
+        .long("account")
+        .help(help)
+        .value_name("EMAIL")
 }
 
 /// Build the clap Command for `gws auth`.
@@ -414,7 +469,11 @@ fn auth_command() -> clap::Command {
                         .value_name("ARGS"),
                 ),
         )
-        .subcommand(clap::Command::new("status").about("Show current authentication state"))
+        .subcommand(
+            clap::Command::new("status")
+                .about("Show current authentication state")
+                .arg(account_arg("Account to inspect (default: the default account)")),
+        )
         .subcommand(
             clap::Command::new("export")
                 .about("Print decrypted credentials to stdout")
@@ -423,9 +482,50 @@ fn auth_command() -> clap::Command {
                         .long("unmasked")
                         .help("Show secrets without masking")
                         .action(clap::ArgAction::SetTrue),
+                )
+                .arg(account_arg("Account to export (default: the default account)")),
+        )
+        .subcommand(
+            clap::Command::new("logout")
+                .about("Clear saved credentials and token cache")
+                .arg(account_arg(
+                    "Account to log out (required when several accounts are configured)",
+                ))
+                .arg(
+                    clap::Arg::new("revoke")
+                        .long("revoke")
+                        .help("Also revoke the refresh token at Google")
+                        .action(clap::ArgAction::SetTrue),
                 ),
         )
-        .subcommand(clap::Command::new("logout").about("Clear saved credentials and token cache"))
+        .subcommand(clap::Command::new("list").about("List configured accounts and the default"))
+        .subcommand(
+            clap::Command::new("default")
+                .about("Set the default account (used for reads when --account is omitted)")
+                .arg(
+                    clap::Arg::new("email")
+                        .required(true)
+                        .value_name("EMAIL"),
+                ),
+        )
+        .subcommand(
+            clap::Command::new("import")
+                .about("Import the account from another (single-account) gws config directory")
+                .arg(
+                    clap::Arg::new("from")
+                        .long("from")
+                        .required(true)
+                        .value_name("DIR")
+                        .help("Config directory to import from, e.g. ~/.config/gws-work"),
+                )
+                .arg(
+                    clap::Arg::new("keyring-backend")
+                        .long("keyring-backend")
+                        .value_parser(["keyring", "file"])
+                        .default_value("keyring")
+                        .help("Where that directory's encryption key lives: keyring, or its .encryption_key file"),
+                ),
+        )
 }
 
 /// Handle `gws auth <subcommand>`.
@@ -448,9 +548,9 @@ pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
 
     match matches.subcommand() {
         Some(("login", sub_m)) => {
-            let (scope_mode, services_filter) = parse_login_args(sub_m);
+            let (scope_mode, services_filter, client_secret) = parse_login_args(sub_m)?;
 
-            handle_login_inner(scope_mode, services_filter).await
+            handle_login_inner(scope_mode, services_filter, client_secret).await
         }
         Some(("setup", sub_m)) => {
             // Collect remaining args and delegate to setup's own clap parser.
@@ -460,12 +560,39 @@ pub async fn handle_auth_command(args: &[String]) -> Result<(), GwsError> {
                 .unwrap_or_default();
             crate::setup::run_setup(&setup_args).await
         }
-        Some(("status", _)) => handle_status().await,
+        Some(("status", _)) => {
+            select_account_for_auth(crate::accounts::Access::Read)?;
+            handle_status().await
+        }
         Some(("export", sub_m)) => {
             let unmasked = sub_m.get_flag("unmasked");
+            select_account_for_auth(crate::accounts::Access::Read)?;
             handle_export(unmasked).await
         }
-        Some(("logout", _)) => handle_logout(),
+        Some(("logout", sub_m)) => {
+            // Logging out destroys credentials, so it follows the write rule.
+            select_account_for_auth(crate::accounts::Access::Write)?;
+            handle_logout(sub_m.get_flag("revoke")).await
+        }
+        Some(("list", _)) => handle_list(),
+        Some(("default", sub_m)) => {
+            let email = sub_m
+                .get_one::<String>("email")
+                .map(String::as_str)
+                .unwrap_or_default();
+            handle_default(email)
+        }
+        Some(("import", sub_m)) => {
+            let from = sub_m
+                .get_one::<String>("from")
+                .map(String::as_str)
+                .unwrap_or_default();
+            let file_backend = sub_m
+                .get_one::<String>("keyring-backend")
+                .map(String::as_str)
+                == Some("file");
+            handle_import(from, file_backend).await
+        }
         _ => {
             // No subcommand → print help
             auth_command()
@@ -483,7 +610,9 @@ fn login_command() -> clap::Command {
 }
 
 /// Extract `ScopeMode` and optional services filter from parsed login args.
-fn parse_login_args(matches: &clap::ArgMatches) -> (ScopeMode, Option<HashSet<String>>) {
+type LoginArgs = (ScopeMode, Option<HashSet<String>>, Option<PathBuf>);
+
+fn parse_login_args(matches: &clap::ArgMatches) -> Result<LoginArgs, GwsError> {
     let scope_mode = if let Some(scopes_str) = matches.get_one::<String>("scopes") {
         ScopeMode::Custom(
             scopes_str
@@ -508,7 +637,12 @@ fn parse_login_args(matches: &clap::ArgMatches) -> (ScopeMode, Option<HashSet<St
             .collect()
     });
 
-    (scope_mode, services_filter)
+    let client_secret = matches
+        .get_one::<String>("client-secret")
+        .map(|p| crate::validate::validate_safe_file_path(p, "--client-secret"))
+        .transpose()?;
+
+    Ok((scope_mode, services_filter, client_secret))
 }
 
 /// Run the `auth login` flow.
@@ -532,14 +666,14 @@ pub async fn run_login(args: &[String]) -> Result<(), GwsError> {
         Err(e) => return Err(GwsError::Validation(e.to_string())),
     };
 
-    let (scope_mode, services_filter) = parse_login_args(&matches);
+    let (scope_mode, services_filter, client_secret) = parse_login_args(&matches)?;
 
-    handle_login_inner(scope_mode, services_filter).await
+    handle_login_inner(scope_mode, services_filter, client_secret).await
 }
 /// Custom delegate that prints the OAuth URL on its own line for easy copying.
-/// Optionally includes `login_hint` in the URL for account pre-selection.
+/// Adds `login_hint` / `include_granted_scopes` to the URL when requested.
 struct CliFlowDelegate {
-    login_hint: Option<String>,
+    extras: AuthUrlExtras,
 }
 
 impl yup_oauth2::authenticator_delegate::InstalledFlowDelegate for CliFlowDelegate {
@@ -550,21 +684,7 @@ impl yup_oauth2::authenticator_delegate::InstalledFlowDelegate for CliFlowDelega
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
     {
         Box::pin(async move {
-            // Inject login_hint into the OAuth URL if we have one
-            let display_url = if let Some(ref hint) = self.login_hint {
-                let encoded: String = percent_encoding::percent_encode(
-                    hint.as_bytes(),
-                    percent_encoding::NON_ALPHANUMERIC,
-                )
-                .to_string();
-                if url.contains('?') {
-                    format!("{url}&login_hint={encoded}")
-                } else {
-                    format!("{url}?login_hint={encoded}")
-                }
-            } else {
-                url.to_string()
-            };
+            let display_url = self.extras.apply(url);
             eprintln!("Open this URL in your browser to authenticate:\n");
             eprintln!("  {display_url}\n");
             Ok(String::new())
@@ -572,19 +692,129 @@ impl yup_oauth2::authenticator_delegate::InstalledFlowDelegate for CliFlowDelega
     }
 }
 
+/// Where a login stores its credentials.
+#[derive(Debug, Clone, PartialEq)]
+enum LoginTarget {
+    /// A config directory with single-account credentials and no registry:
+    /// overwrite them, as before multi-account support.
+    Legacy,
+    /// Add or update an account in the registry. `requested` is the account
+    /// named by `--account` / `GOOGLE_WORKSPACE_CLI_ACCOUNT`, if any.
+    Account {
+        requested: Option<String>,
+        registry: crate::accounts::Registry,
+    },
+}
+
+impl LoginTarget {
+    /// A fresh config directory starts a registry; one that already holds
+    /// single-account credentials keeps working the old way until imported.
+    fn decide(config: &Path, requested: Option<&str>) -> Result<Self, GwsError> {
+        let registry = crate::accounts::Registry::load(config)?;
+        let requested = requested
+            .map(crate::accounts::normalize_email)
+            .transpose()?;
+        let has_legacy_credentials =
+            config.join("credentials.enc").exists() || config.join("credentials.json").exists();
+        match registry {
+            Some(registry) => Ok(Self::Account {
+                requested,
+                registry,
+            }),
+            None if !has_legacy_credentials => Ok(Self::Account {
+                requested,
+                registry: crate::accounts::Registry::default(),
+            }),
+            None => match requested {
+                None => Ok(Self::Legacy),
+                Some(email) => Err(GwsError::Account {
+                    reason: "noAccountRegistry".to_string(),
+                    message: format!(
+                        "{} holds single-account credentials and no account registry. \
+                         Run `gws auth import --from {}` first, then log in to {email}.",
+                        config.display(),
+                        config.display()
+                    ),
+                    accounts: Vec::new(),
+                    default: None,
+                }),
+            },
+        }
+    }
+}
+
+/// Reads an OAuth client file (Google Cloud Console "installed" format).
+fn load_client_secret_file(path: &Path) -> Result<crate::oauth_config::ClientSecretFile, GwsError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| GwsError::Validation(format!("Cannot read {}: {e}", path.display())))?;
+    serde_json::from_str(&text).map_err(|_| {
+        GwsError::Validation(format!(
+            "{} is not an OAuth client file (expected the \"installed\" JSON downloaded from Google Cloud Console)",
+            path.display()
+        ))
+    })
+}
+
+/// Google caps unverified (testing-mode) OAuth apps at this many scopes.
+const UNVERIFIED_APP_SCOPE_LIMIT: usize = 25;
+
 /// Inner login implementation that takes already-parsed options.
 async fn handle_login_inner(
     scope_mode: ScopeMode,
     services_filter: Option<HashSet<String>>,
+    client_secret_path: Option<PathBuf>,
 ) -> Result<(), GwsError> {
+    let config = config_dir();
+    let requested = crate::accounts::requested_account();
+    let target = LoginTarget::decide(&config, requested.as_deref())?;
+
+    if client_secret_path.is_some() && target == LoginTarget::Legacy {
+        return Err(GwsError::Validation(
+            "--client-secret needs an account registry. Run `gws auth import --from <dir>` first."
+                .to_string(),
+        ));
+    }
+
+    // When the account is known up front, select it now so its own OAuth
+    // client (if any) is used and its stored scopes can be merged.
+    let mut previous_scopes = Vec::new();
+    if let LoginTarget::Account {
+        requested: Some(email),
+        registry,
+    } = &target
+    {
+        if let Some(meta) = registry.accounts.get(email) {
+            previous_scopes = meta.scopes.clone();
+        }
+        crate::accounts::set_active(crate::accounts::Active::Account(
+            crate::accounts::Selection {
+                email: email.clone(),
+                dir: crate::accounts::account_dir(&config, email),
+                source: crate::accounts::Source::Flag,
+            },
+        ));
+    }
+
     // Resolve client_id and client_secret:
-    // 1. Env vars (highest priority)
-    // 2. Saved client_secret.json from `gws auth setup` or manual download
-    let (client_id, client_secret, project_id) = resolve_client_credentials()?;
+    // 0. --client-secret (pinned to this account only)
+    // 1. Env vars
+    // 2. The account's own client_secret.json, then the shared one
+    let own_client = client_secret_path
+        .as_deref()
+        .map(load_client_secret_file)
+        .transpose()?;
+    let (client_id, client_secret, project_id) = match &own_client {
+        Some(file) => (
+            file.installed.client_id.clone(),
+            file.installed.client_secret.clone(),
+            Some(file.installed.project_id.clone()).filter(|p| !p.is_empty()),
+        ),
+        None => resolve_client_credentials()?,
+    };
 
     // Persist credentials to client_secret.json if not already saved,
     // so they survive env var removal or shell session changes.
-    if !crate::oauth_config::client_config_path().exists() {
+    if own_client.is_none() && !crate::oauth_config::client_config_path().exists() {
         let _ = crate::oauth_config::save_client_config(
             &client_id,
             &client_secret,
@@ -613,17 +843,36 @@ async fn handle_login_inner(
         }
     }
 
+    // Re-logging into an account adds scopes instead of replacing them.
+    let is_account = matches!(target, LoginTarget::Account { .. });
+    if is_account {
+        scopes = crate::accounts::merge_scopes(&previous_scopes, &scopes);
+        if scopes.len() > UNVERIFIED_APP_SCOPE_LIMIT {
+            eprintln!(
+                "Warning: requesting {} scopes. Unverified (testing-mode) OAuth apps are limited to {UNVERIFIED_APP_SCOPE_LIMIT}.",
+                scopes.len()
+            );
+        }
+    }
+
     // Ensure config directory exists
-    let config = config_dir();
     std::fs::create_dir_all(&config)
         .map_err(|e| GwsError::Validation(format!("Failed to create config directory: {e}")))?;
+
+    let extras = AuthUrlExtras {
+        login_hint: match &target {
+            LoginTarget::Account { requested, .. } => requested.clone(),
+            LoginTarget::Legacy => None,
+        },
+        include_granted_scopes: is_account,
+    };
 
     // If proxy env vars are set, use proxy-aware OAuth flow (reqwest)
     // Otherwise use yup-oauth2 (faster, but doesn't support proxy)
     let (access_token, refresh_token) = if crate::auth::has_proxy_env() {
-        login_with_proxy_support(&client_id, &client_secret, &scopes).await?
+        login_with_proxy_support(&client_id, &client_secret, &scopes, &extras).await?
     } else {
-        login_with_yup_oauth(&config, &client_id, &client_secret, &scopes).await?
+        login_with_yup_oauth(&config, &client_id, &client_secret, &scopes, &extras).await?
     };
 
     // Build credentials in the standard authorized_user format
@@ -640,23 +889,116 @@ async fn handle_login_inner(
     // Fetch the user's email from Google userinfo
     let actual_email = fetch_userinfo_email(&access_token).await;
 
-    // Save encrypted credentials
-    let enc_path = credential_store::save_encrypted(&creds_str)
-        .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
+    let mut output = match target {
+        LoginTarget::Legacy => {
+            let enc_path = credential_store::save_encrypted(&creds_str)
+                .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
+            // Tokens cached for the previous login may belong to another
+            // account (#780); drop them.
+            clear_account_caches(&config);
+            json!({
+                "status": "success",
+                "message": "Authentication successful. Encrypted credentials saved.",
+                "account": actual_email.as_deref().unwrap_or("(unknown)"),
+                "credentials_file": enc_path.display().to_string(),
+            })
+        }
+        LoginTarget::Account {
+            requested,
+            mut registry,
+        } => {
+            let email = actual_email
+                .as_deref()
+                .ok_or_else(|| {
+                    GwsError::Auth(
+                        "Signed in, but could not determine the account's email. Nothing was saved."
+                            .to_string(),
+                    )
+                })
+                .and_then(crate::accounts::normalize_email)?;
+            check_login_email(requested.as_deref(), &email, &registry)?;
 
-    let output = json!({
-        "status": "success",
-        "message": "Authentication successful. Encrypted credentials saved.",
-        "account": actual_email.as_deref().unwrap_or("(unknown)"),
-        "credentials_file": enc_path.display().to_string(),
-        "encryption": "AES-256-GCM (key in OS keyring or local `.encryption_key`; set GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file for headless)",
-        "scopes": scopes,
-    });
+            let dir = crate::accounts::account_dir(&config, &email);
+            crate::accounts::create_private_dir(&dir)?;
+            if requested.is_none() {
+                crate::accounts::set_active(crate::accounts::Active::Account(
+                    crate::accounts::Selection {
+                        email: email.clone(),
+                        dir: dir.clone(),
+                        source: crate::accounts::Source::Flag,
+                    },
+                ));
+            }
+            let enc_path = crate::credential_store::save_encrypted_to(
+                &dir.join("credentials.enc"),
+                &creds_str,
+            )
+            .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
+            clear_account_caches(&dir);
+            if let Some(file) = &own_client {
+                let json = serde_json::to_string_pretty(file)
+                    .map_err(|e| GwsError::Other(anyhow::anyhow!(e)))?;
+                let path = dir.join(crate::oauth_config::CLIENT_SECRET_FILE);
+                crate::fs_util::atomic_write(&path, json.as_bytes()).map_err(|e| {
+                    GwsError::Validation(format!("Failed to write {}: {e}", path.display()))
+                })?;
+            }
+
+            registry.upsert(&email, scopes.clone(), &chrono::Utc::now().to_rfc3339());
+            registry.save(&config)?;
+            json!({
+                "status": "success",
+                "message": "Authentication successful. Encrypted credentials saved.",
+                "account": email,
+                "default": registry.default.as_deref() == Some(email.as_str()),
+                "credentials_file": enc_path.display().to_string(),
+            })
+        }
+    };
+    output["encryption"] = json!("AES-256-GCM (key in OS keyring or local `.encryption_key`; set GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file for headless)");
+    output["scopes"] = json!(scopes);
     println!(
         "{}",
         serde_json::to_string_pretty(&output).unwrap_or_default()
     );
     Ok(())
+}
+
+/// Rejects a login whose Google account differs from the one requested.
+fn check_login_email(
+    requested: Option<&str>,
+    actual: &str,
+    registry: &crate::accounts::Registry,
+) -> Result<(), GwsError> {
+    match requested {
+        Some(requested) if requested != actual => Err(GwsError::Account {
+            reason: "accountMismatch".to_string(),
+            message: format!(
+                "Signed in as {actual}, but {requested} was requested. Nothing was saved. \
+                 Pick {requested} in the browser, or omit --account to add {actual}."
+            ),
+            accounts: registry.emails(),
+            default: registry.default.clone(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Removes token and timezone caches in `dir` so they can't outlive the
+/// credentials they were derived from.
+fn clear_account_caches(dir: &Path) {
+    for name in [
+        "token_cache.json",
+        "sa_token_cache.json",
+        "account_timezone",
+    ] {
+        let path = dir.join(name);
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Warning: failed to remove {}: {e}", path.display());
+            }
+        }
+    }
 }
 
 /// Fetch the authenticated user's email from Google's userinfo endpoint.
@@ -1232,6 +1574,9 @@ async fn handle_status() -> Result<(), GwsError> {
         "plain_credentials_exists": has_plain,
         "token_cache_exists": has_token_cache,
     });
+    if let Some(account) = crate::accounts::active_account() {
+        output["account"] = json!(account.email);
+    }
 
     // Show client config (client_secret.json) status
     let config_path = crate::oauth_config::client_config_path();
@@ -1453,11 +1798,17 @@ async fn handle_status() -> Result<(), GwsError> {
     Ok(())
 }
 
-fn handle_logout() -> Result<(), GwsError> {
+async fn handle_logout(revoke: bool) -> Result<(), GwsError> {
     let plain_path = plain_credentials_path();
     let enc_path = credential_store::encrypted_credentials_path();
     let token_cache = token_cache_path();
-    let sa_token_cache = config_dir().join("sa_token_cache.json");
+    let sa_token_cache = crate::accounts::credential_dir().join("sa_token_cache.json");
+
+    let revoked = if revoke {
+        Some(revoke_saved_refresh_token(&enc_path, &plain_path).await)
+    } else {
+        None
+    };
 
     let mut removed = Vec::new();
 
@@ -1473,7 +1824,29 @@ fn handle_logout() -> Result<(), GwsError> {
     // Invalidate cached account timezone (may belong to old account)
     crate::timezone::invalidate_cache();
 
-    let output = if removed.is_empty() {
+    // A registered account is removed entirely: its directory (including a
+    // per-account OAuth client) and its registry entry.
+    let mut account_removed = None;
+    if let Some(account) = crate::accounts::active_account() {
+        let client = account.dir.join(crate::oauth_config::CLIENT_SECRET_FILE);
+        if client.exists() {
+            std::fs::remove_file(&client).map_err(|e| {
+                GwsError::Validation(format!("Failed to remove {}: {e}", client.display()))
+            })?;
+            removed.push(client.display().to_string());
+        }
+        // Only removes the directory if nothing unexpected is left in it.
+        let _ = std::fs::remove_dir(&account.dir);
+
+        let config = config_dir();
+        if let Some(mut registry) = crate::accounts::Registry::load(&config)? {
+            registry.remove(&account.email);
+            registry.save(&config)?;
+        }
+        account_removed = Some(account.email.clone());
+    }
+
+    let mut output = if removed.is_empty() {
         json!({
             "status": "success",
             "message": "No credentials found to remove.",
@@ -1485,7 +1858,296 @@ fn handle_logout() -> Result<(), GwsError> {
             "removed": removed,
         })
     };
+    if let Some(email) = account_removed {
+        output["account"] = json!(email);
+    }
+    match revoked {
+        Some(Ok(())) => output["revoked"] = json!(true),
+        Some(Err(e)) => {
+            eprintln!("Warning: could not revoke the refresh token at Google: {e}");
+            output["revoked"] = json!(false);
+        }
+        None => {}
+    }
 
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// Revokes the saved refresh token at Google, so the grant stops working even
+/// if a copy of the credentials survives elsewhere.
+async fn revoke_saved_refresh_token(enc_path: &Path, plain_path: &Path) -> Result<(), String> {
+    let creds = if enc_path.exists() {
+        credential_store::load_encrypted_from_path(enc_path).map_err(|e| format!("{e:#}"))?
+    } else if plain_path.exists() {
+        std::fs::read_to_string(plain_path).map_err(|e| e.to_string())?
+    } else {
+        return Err("no saved credentials".to_string());
+    };
+    let refresh_token = serde_json::from_str::<serde_json::Value>(&creds)
+        .ok()
+        .and_then(|v| v.get("refresh_token")?.as_str().map(str::to_string))
+        .ok_or_else(|| "saved credentials have no refresh token".to_string())?;
+    let client = crate::client::shared_client().map_err(|e| e.to_string())?;
+    let resp = client
+        .post("https://oauth2.googleapis.com/revoke")
+        .form(&[("token", refresh_token.as_str())])
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("revoke endpoint returned {}", resp.status()))
+    }
+}
+
+/// Resolves the account an `auth` subcommand acts on.
+fn select_account_for_auth(access: crate::accounts::Access) -> Result<(), GwsError> {
+    crate::accounts::select(access, false).map(|_| ())
+}
+
+fn handle_list() -> Result<(), GwsError> {
+    let config = config_dir();
+    let output = match crate::accounts::Registry::load(&config)? {
+        Some(registry) => {
+            let accounts: Vec<serde_json::Value> = registry
+                .accounts
+                .iter()
+                .map(|(email, meta)| {
+                    let own_client = crate::accounts::account_dir(&config, email)
+                        .join(crate::oauth_config::CLIENT_SECRET_FILE)
+                        .exists();
+                    json!({
+                        "email": email,
+                        "default": registry.default.as_deref() == Some(email.as_str()),
+                        "client": if own_client { "account" } else { "shared" },
+                        "scopes": meta.scopes,
+                        "added": meta.added,
+                    })
+                })
+                .collect();
+            json!({ "default": registry.default, "accounts": accounts })
+        }
+        None => json!({
+            "default": null,
+            "accounts": [],
+            "message": format!(
+                "{} has no account registry (single-account mode). Run `gws auth login` or `gws auth import --from <dir>`.",
+                config.display()
+            ),
+        }),
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn handle_default(raw_email: &str) -> Result<(), GwsError> {
+    let email = crate::accounts::normalize_email(raw_email)?;
+    let config = config_dir();
+    let mut registry = crate::accounts::Registry::load(&config)?.ok_or_else(|| {
+        GwsError::Validation(format!(
+            "{} has no account registry. Run `gws auth login` first.",
+            config.display()
+        ))
+    })?;
+    registry.set_default(&email)?;
+    registry.save(&config)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({ "status": "success", "default": email }))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// Scopes granted to an access token, from Google's tokeninfo endpoint.
+async fn fetch_granted_scopes(access_token: &str) -> Vec<String> {
+    let Ok(client) = crate::client::shared_client() else {
+        return Vec::new();
+    };
+    let Ok(resp) = client
+        .get("https://oauth2.googleapis.com/tokeninfo")
+        .query(&[("access_token", access_token)])
+        .send()
+        .await
+    else {
+        return Vec::new();
+    };
+    resp.json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| v.get("scope")?.as_str().map(str::to_string))
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Reads the client ID from an OAuth client file, if it parses.
+fn client_id_of(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let file: crate::oauth_config::ClientSecretFile = serde_json::from_str(&text).ok()?;
+    Some(file.installed.client_id)
+}
+
+/// OAuth user credentials read from a config directory being imported.
+#[derive(Debug)]
+struct ImportSource {
+    creds_json: String,
+    client_id: String,
+    client_secret: String,
+    refresh_token: String,
+}
+
+/// Decrypts `src/credentials.enc` with that directory's key: its
+/// `.encryption_key` file for the file backend, otherwise this process's key.
+fn read_import_source(src: &Path, file_backend: bool) -> Result<ImportSource, GwsError> {
+    let enc = src.join("credentials.enc");
+    let data = std::fs::read(&enc)
+        .map_err(|e| GwsError::Validation(format!("Cannot read {}: {e}", enc.display())))?;
+    let plaintext = if file_backend {
+        let key_path = src.join(".encryption_key");
+        let key = credential_store::load_key_file(&key_path).ok_or_else(|| {
+            GwsError::Validation(format!("No valid encryption key at {}", key_path.display()))
+        })?;
+        credential_store::decrypt_with_key(&key, &data)
+    } else {
+        credential_store::decrypt(&data)
+    }
+    .map_err(|e| {
+        GwsError::Auth(format!(
+            "Could not decrypt {} ({e:#}). If that directory used the file backend, pass --keyring-backend file.",
+            enc.display()
+        ))
+    })?;
+    let creds_json = String::from_utf8(plaintext)
+        .map_err(|_| GwsError::Validation(format!("{} is not valid UTF-8", enc.display())))?;
+    let creds: serde_json::Value = serde_json::from_str(&creds_json)
+        .map_err(|_| GwsError::Validation(format!("{} does not contain JSON", enc.display())))?;
+    let field = |name: &str| creds.get(name).and_then(|v| v.as_str()).map(str::to_string);
+    match (
+        field("client_id"),
+        field("client_secret"),
+        field("refresh_token"),
+    ) {
+        (Some(client_id), Some(client_secret), Some(refresh_token)) => Ok(ImportSource {
+            creds_json,
+            client_id,
+            client_secret,
+            refresh_token,
+        }),
+        _ => Err(GwsError::Validation(format!(
+            "{} does not hold OAuth user credentials (service accounts can't be imported)",
+            enc.display()
+        ))),
+    }
+}
+
+/// Imports the single-account credentials of another config directory (or of
+/// this one, converting it to the account registry).
+///
+/// `from` is deliberately not restricted to the current directory: it points
+/// at another gws config directory (e.g. `~/.config/gws-work`), and only the
+/// gws-written `credentials.enc`, `.encryption_key` and `client_secret.json`
+/// are read from it. Nothing in it is modified, except when importing the
+/// config directory into itself.
+async fn handle_import(from: &str, file_backend: bool) -> Result<(), GwsError> {
+    crate::validate::reject_dangerous_chars(from, "--from")?;
+    let src = std::fs::canonicalize(from)
+        .map_err(|e| GwsError::Validation(format!("Cannot open {from}: {e}")))?;
+    let config = config_dir();
+    std::fs::create_dir_all(&config)
+        .map_err(|e| GwsError::Validation(format!("Failed to create config directory: {e}")))?;
+    let in_place = std::fs::canonicalize(&config).ok().as_deref() == Some(src.as_path());
+
+    // 1. Decrypt the source credentials with the source's key.
+    let ImportSource {
+        creds_json: creds_str,
+        client_id,
+        client_secret,
+        refresh_token,
+    } = read_import_source(&src, file_backend)?;
+
+    // 2. Find out whose credentials these are, and what they may do.
+    let access_token =
+        crate::auth::refresh_token_with_reqwest(&client_id, &client_secret, &refresh_token)
+            .await
+            .map_err(|e| GwsError::Auth(format!("The imported credentials don't work: {e:#}")))?;
+    let email = fetch_userinfo_email(&access_token)
+        .await
+        .ok_or_else(|| GwsError::Auth("Could not determine the account's email".to_string()))
+        .and_then(|e| crate::accounts::normalize_email(&e))?;
+    let scopes = fetch_granted_scopes(&access_token).await;
+
+    let mut registry = crate::accounts::Registry::load(&config)?.unwrap_or_default();
+    if registry.accounts.contains_key(&email) {
+        return Err(GwsError::Account {
+            reason: "accountExists".to_string(),
+            message: format!(
+                "{email} is already configured. Run `gws auth logout --account {email}` first to re-import it."
+            ),
+            accounts: registry.emails(),
+            default: registry.default.clone(),
+        });
+    }
+
+    // 3. Store them as an account, encrypted with this config's key.
+    let dir = crate::accounts::account_dir(&config, &email);
+    crate::accounts::create_private_dir(&dir)?;
+    let enc_path = credential_store::save_encrypted_to(&dir.join("credentials.enc"), &creds_str)
+        .map_err(|e| GwsError::Auth(format!("Failed to encrypt credentials: {e}")))?;
+
+    // Keep the source's OAuth client for future logins if it isn't the shared one.
+    let shared = crate::oauth_config::shared_client_config_path();
+    let src_client = src.join(crate::oauth_config::CLIENT_SECRET_FILE);
+    let mut own_client = false;
+    if !in_place && src_client.exists() && client_id_of(&src_client) != client_id_of(&shared) {
+        let text = std::fs::read(&src_client).map_err(|e| {
+            GwsError::Validation(format!("Cannot read {}: {e}", src_client.display()))
+        })?;
+        let path = dir.join(crate::oauth_config::CLIENT_SECRET_FILE);
+        crate::fs_util::atomic_write(&path, &text).map_err(|e| {
+            GwsError::Validation(format!("Failed to write {}: {e}", path.display()))
+        })?;
+        own_client = true;
+    }
+
+    registry.upsert(&email, scopes.clone(), &chrono::Utc::now().to_rfc3339());
+    registry.save(&config)?;
+
+    // 4. Importing a config directory into itself: retire its single-account
+    //    files so nothing is left that looks like the active credentials.
+    let mut retired = Vec::new();
+    if in_place {
+        let stamp = chrono::Local::now().format("%Y%m%d%H%M%S");
+        for name in ["credentials.enc", "token_cache.json", "sa_token_cache.json"] {
+            let path = config.join(name);
+            if path.exists() {
+                let target = config.join(format!("{name}.imported-{stamp}"));
+                std::fs::rename(&path, &target).map_err(|e| {
+                    GwsError::Validation(format!("Failed to rename {}: {e}", path.display()))
+                })?;
+                retired.push(target.display().to_string());
+            }
+        }
+        let _ = std::fs::remove_file(config.join("account_timezone"));
+    }
+
+    let output = json!({
+        "status": "success",
+        "account": email,
+        "default": registry.default.as_deref() == Some(email.as_str()),
+        "imported_from": src.display().to_string(),
+        "credentials_file": enc_path.display().to_string(),
+        "client": if own_client { "account" } else { "shared" },
+        "scope_count": scopes.len(),
+        "retired": retired,
+    });
     println!(
         "{}",
         serde_json::to_string_pretty(&output).unwrap_or_default()
@@ -2487,7 +3149,12 @@ mod tests {
             "https://www.googleapis.com/auth/drive".to_string(),
             "openid".to_string(),
         ];
-        let url = build_proxy_auth_url("client id", "http://localhost:8080/callback path", &scopes);
+        let url = build_proxy_auth_url(
+            "client id",
+            "http://localhost:8080/callback path",
+            &scopes,
+            &AuthUrlExtras::default(),
+        );
 
         assert!(url.contains("client_id=client%20id"));
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback%20path"));
@@ -2531,5 +3198,267 @@ mod tests {
 
         let err = read_refresh_token_from_cache(file.path()).unwrap_err();
         assert!(err.to_string().contains("no refresh token was returned"));
+    }
+
+    // -- multi-account -------------------------------------------------------
+
+    use crate::accounts::Registry;
+
+    struct ConfigDirGuard(Option<std::ffi::OsString>);
+
+    impl ConfigDirGuard {
+        fn set(path: &Path) -> Self {
+            let previous = std::env::var_os("GOOGLE_WORKSPACE_CLI_CONFIG_DIR");
+            std::env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", path);
+            Self(previous)
+        }
+    }
+
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR", v),
+                None => std::env::remove_var("GOOGLE_WORKSPACE_CLI_CONFIG_DIR"),
+            }
+        }
+    }
+
+    fn account_reason(err: GwsError) -> String {
+        match err {
+            GwsError::Account { reason, .. } => reason,
+            other => panic!("expected account error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn auth_url_extras_appends_params() {
+        let extras = AuthUrlExtras {
+            login_hint: Some("me+x@example.com".to_string()),
+            include_granted_scopes: true,
+        };
+        assert_eq!(
+            extras.apply("https://a/b?x=1"),
+            "https://a/b?x=1&login_hint=me%2Bx%40example%2Ecom&include_granted_scopes=true"
+        );
+        assert_eq!(AuthUrlExtras::default().apply("https://a/b"), "https://a/b");
+        let incremental = AuthUrlExtras {
+            login_hint: None,
+            include_granted_scopes: true,
+        };
+        assert_eq!(
+            incremental.apply("https://a/b"),
+            "https://a/b?include_granted_scopes=true"
+        );
+    }
+
+    #[test]
+    fn proxy_auth_url_includes_extras() {
+        let url = build_proxy_auth_url(
+            "id",
+            "http://localhost:1",
+            &["s".to_string()],
+            &AuthUrlExtras {
+                login_hint: Some("a@b.co".to_string()),
+                include_granted_scopes: true,
+            },
+        );
+        assert!(url.contains("&login_hint=a%40b%2Eco"));
+        assert!(url.ends_with("&include_granted_scopes=true"));
+    }
+
+    #[test]
+    fn login_target_fresh_dir_starts_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            LoginTarget::decide(dir.path(), None).unwrap(),
+            LoginTarget::Account {
+                requested: None,
+                registry: Registry::default()
+            }
+        );
+        assert_eq!(
+            LoginTarget::decide(dir.path(), Some("Me@X.com")).unwrap(),
+            LoginTarget::Account {
+                requested: Some("me@x.com".to_string()),
+                registry: Registry::default()
+            }
+        );
+    }
+
+    #[test]
+    fn login_target_legacy_dir_keeps_single_account() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("credentials.enc"), b"x").unwrap();
+        assert_eq!(
+            LoginTarget::decide(dir.path(), None).unwrap(),
+            LoginTarget::Legacy
+        );
+        assert_eq!(
+            account_reason(LoginTarget::decide(dir.path(), Some("a@x.com")).unwrap_err()),
+            "noAccountRegistry"
+        );
+    }
+
+    #[test]
+    fn login_target_registry_wins_over_legacy_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("credentials.enc"), b"x").unwrap();
+        let mut registry = Registry::default();
+        registry.upsert("a@x.com", vec![], "t");
+        registry.save(dir.path()).unwrap();
+        assert_eq!(
+            LoginTarget::decide(dir.path(), None).unwrap(),
+            LoginTarget::Account {
+                requested: None,
+                registry
+            }
+        );
+    }
+
+    #[test]
+    fn login_target_rejects_invalid_account() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            LoginTarget::decide(dir.path(), Some("../../etc")).unwrap_err(),
+            GwsError::Validation(_)
+        ));
+    }
+
+    #[test]
+    fn check_login_email_rejects_mismatch() {
+        let registry = Registry::default();
+        assert!(check_login_email(None, "a@x.com", &registry).is_ok());
+        assert!(check_login_email(Some("a@x.com"), "a@x.com", &registry).is_ok());
+        assert_eq!(
+            account_reason(check_login_email(Some("a@x.com"), "b@x.com", &registry).unwrap_err()),
+            "accountMismatch"
+        );
+    }
+
+    #[test]
+    fn clear_account_caches_keeps_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["token_cache.json", "account_timezone", "credentials.enc"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        clear_account_caches(dir.path());
+        assert!(!dir.path().join("token_cache.json").exists());
+        assert!(!dir.path().join("account_timezone").exists());
+        assert!(dir.path().join("credentials.enc").exists());
+    }
+
+    fn write_file_key_source(dir: &Path, key: &[u8; 32], creds: &str) {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let key_path = dir.join(".encryption_key");
+        std::fs::write(&key_path, STANDARD.encode(key)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let data = credential_store::encrypt_with_key(key, creds.as_bytes()).unwrap();
+        std::fs::write(dir.join("credentials.enc"), data).unwrap();
+    }
+
+    const USER_CREDS: &str = r#"{"type":"authorized_user","client_id":"cid","client_secret":"csec","refresh_token":"rt"}"#;
+
+    #[test]
+    fn read_import_source_decrypts_with_file_key() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file_key_source(dir.path(), &[7u8; 32], USER_CREDS);
+        let src = read_import_source(dir.path(), true).unwrap();
+        assert_eq!(src.client_id, "cid");
+        assert_eq!(src.client_secret, "csec");
+        assert_eq!(src.refresh_token, "rt");
+        assert_eq!(src.creds_json, USER_CREDS);
+    }
+
+    #[test]
+    fn read_import_source_wrong_key_errors_and_keeps_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file_key_source(dir.path(), &[7u8; 32], USER_CREDS);
+        let enc = std::fs::read(dir.path().join("credentials.enc")).unwrap();
+        // Replace the key file with a different key.
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        std::fs::write(
+            dir.path().join(".encryption_key"),
+            STANDARD.encode([9u8; 32]),
+        )
+        .unwrap();
+        match read_import_source(dir.path(), true).unwrap_err() {
+            GwsError::Auth(msg) => assert!(msg.contains("Could not decrypt"), "got: {msg}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("credentials.enc")).unwrap(),
+            enc
+        );
+    }
+
+    #[test]
+    fn read_import_source_requires_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("credentials.enc"), b"0123456789abcdef").unwrap();
+        assert!(matches!(
+            read_import_source(dir.path(), true).unwrap_err(),
+            GwsError::Validation(_)
+        ));
+    }
+
+    #[test]
+    fn read_import_source_rejects_service_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file_key_source(
+            dir.path(),
+            &[7u8; 32],
+            r#"{"type":"service_account","client_email":"sa@p.iam.gserviceaccount.com"}"#,
+        );
+        assert!(matches!(
+            read_import_source(dir.path(), true).unwrap_err(),
+            GwsError::Validation(_)
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_command_updates_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        let mut registry = Registry::default();
+        registry.upsert("a@x.com", vec![], "t");
+        registry.upsert("b@x.com", vec![], "t");
+        registry.save(dir.path()).unwrap();
+
+        handle_default("B@X.com").unwrap();
+        let loaded = Registry::load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.default.as_deref(), Some("b@x.com"));
+
+        assert_eq!(
+            account_reason(handle_default("c@x.com").unwrap_err()),
+            "unknownAccount"
+        );
+        assert!(handle_list().is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn default_command_without_registry_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = ConfigDirGuard::set(dir.path());
+        assert!(handle_default("a@x.com").is_err());
+        assert!(handle_list().is_ok());
+    }
+
+    #[test]
+    fn client_id_of_reads_installed_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client_secret.json");
+        std::fs::write(
+            &path,
+            r#"{"installed":{"client_id":"abc","client_secret":"s","project_id":"p","auth_uri":"u","token_uri":"t"}}"#,
+        )
+        .unwrap();
+        assert_eq!(client_id_of(&path).as_deref(), Some("abc"));
+        assert_eq!(client_id_of(&dir.path().join("missing.json")), None);
     }
 }

@@ -46,7 +46,7 @@ struct TokenResponse {
 
 /// Refresh an access token using reqwest (supports HTTP proxy via environment variables).
 /// This is used as a fallback when yup-oauth2's hyper-based client fails due to proxy issues.
-async fn refresh_token_with_reqwest(
+pub(crate) async fn refresh_token_with_reqwest(
     client_id: &str,
     client_secret: &str,
     refresh_token: &str,
@@ -219,11 +219,30 @@ pub async fn get_token(scopes: &[&str]) -> anyhow::Result<String> {
         }
     }
 
+    // `main` normally selects the account before any token is requested. If a
+    // code path gets here first, resolve it now, treating the call as a write
+    // so it can never silently fall back to the default account.
+    crate::accounts::select(crate::accounts::Access::Write, false)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let creds_file = std::env::var("GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE").ok();
-    let config_dir = crate::auth_commands::config_dir();
+    let credential_dir = crate::accounts::credential_dir();
     let enc_path = credential_store::encrypted_credentials_path();
-    let default_path = config_dir.join("credentials.json");
-    let token_cache = config_dir.join("token_cache.json");
+    let default_path = credential_dir.join("credentials.json");
+    let token_cache = credential_dir.join("token_cache.json");
+
+    // A registered account must use its own credentials. Falling through to
+    // ADC here would silently run as a different identity.
+    if let Some(account) = crate::accounts::active_account() {
+        if creds_file.is_none() && !enc_path.exists() {
+            anyhow::bail!(
+                "Credentials for account {} are missing ({}). Run `gws auth login --account {}`.",
+                account.email,
+                enc_path.display(),
+                account.email
+            );
+        }
+    }
 
     let creds = load_credentials_inner(creds_file.as_deref(), &enc_path, &default_path).await?;
     get_token_inner(scopes, creds, &token_cache).await
@@ -358,33 +377,19 @@ async fn load_credentials_inner(
                 return parse_credential_file(enc_path, &json_str).await;
             }
             Err(e) => {
-                // Decryption failed — the encryption key likely changed (e.g. after
-                // an upgrade that migrated keys between keyring and file storage).
-                // Remove the stale file so the next `gws auth login` starts fresh,
-                // and fall through to other credential sources (plaintext, ADC).
-                eprintln!(
-                    "Warning: removing undecryptable credentials file ({}): {e:#}",
-                    enc_path.display()
+                // Decryption failed: the encryption key likely differs from the
+                // one used to write the file (wrong keyring backend, another
+                // machine, or a lost keychain entry). Never delete the file:
+                // it is often recoverable with the right key, and falling
+                // through to other sources would silently switch identity.
+                anyhow::bail!(
+                    "Could not decrypt {} with the {} key backend: {e:#}. The file was left \
+                     untouched. If it was written with a different backend, set \
+                     GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND to match (keyring or file); \
+                     otherwise run `gws auth login` to replace it.",
+                    enc_path.display(),
+                    credential_store::active_backend_name()
                 );
-                if let Err(err) = tokio::fs::remove_file(enc_path).await {
-                    eprintln!(
-                        "Warning: failed to remove stale credentials file '{}': {err}",
-                        enc_path.display()
-                    );
-                }
-                // Also remove stale token caches that used the old key.
-                for cache_file in ["token_cache.json", "sa_token_cache.json"] {
-                    let path = enc_path.with_file_name(cache_file);
-                    if let Err(err) = tokio::fs::remove_file(&path).await {
-                        if err.kind() != std::io::ErrorKind::NotFound {
-                            eprintln!(
-                                "Warning: failed to remove stale token cache '{}': {err}",
-                                path.display()
-                            );
-                        }
-                    }
-                }
-                // Fall through to remaining credential sources below.
             }
         }
     }
@@ -825,53 +830,51 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_load_credentials_corrupt_encrypted_file_is_removed() {
-        // When credentials.enc cannot be decrypted, the file should be removed
-        // automatically and the function should fall through to other sources.
+    async fn test_load_credentials_corrupt_encrypted_file_is_kept() {
+        // When credentials.enc cannot be decrypted (usually the wrong keyring
+        // backend), it must be left untouched and reported, never deleted.
         let tmp = tempfile::tempdir().unwrap();
         let _home_guard = EnvVarGuard::set("HOME", tmp.path());
         let _adc_guard = EnvVarGuard::remove("GOOGLE_APPLICATION_CREDENTIALS");
 
         let dir = tempfile::tempdir().unwrap();
         let enc_path = dir.path().join("credentials.enc");
+        let cache_path = dir.path().join("token_cache.json");
 
-        // Write garbage data that cannot be decrypted.
-        tokio::fs::write(&enc_path, b"not-valid-encrypted-data-at-all-1234567890")
-            .await
-            .unwrap();
-        assert!(enc_path.exists());
+        let garbage = b"not-valid-encrypted-data-at-all-1234567890";
+        tokio::fs::write(&enc_path, garbage).await.unwrap();
+        tokio::fs::write(&cache_path, b"cache").await.unwrap();
 
         let result =
             load_credentials_inner(None, &enc_path, &PathBuf::from("/does/not/exist")).await;
 
-        // Should fall through to "No credentials found" (not a decryption error).
-        assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("Could not decrypt"), "got: {msg}");
         assert!(
-            msg.contains("No credentials found"),
-            "Should fall through to final error, got: {msg}"
+            msg.contains("GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND"),
+            "got: {msg}"
         );
         assert!(
-            !enc_path.exists(),
-            "Stale credentials.enc must be removed after decryption failure"
+            !msg.starts_with("No credentials found"),
+            "must not look like a logged-out state"
         );
+        assert_eq!(tokio::fs::read(&enc_path).await.unwrap(), garbage);
+        assert!(cache_path.exists(), "token cache must be kept too");
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_load_credentials_corrupt_encrypted_falls_through_to_plaintext() {
-        // When credentials.enc is corrupt but a valid plaintext file exists,
-        // the function should fall through and use the plaintext credentials.
+    async fn test_load_credentials_corrupt_encrypted_does_not_fall_through_to_plaintext() {
+        // A corrupt credentials.enc must not silently switch to another
+        // credential source, which could be a different identity.
         let dir = tempfile::tempdir().unwrap();
         let enc_path = dir.path().join("credentials.enc");
         let plain_path = dir.path().join("credentials.json");
 
-        // Write garbage encrypted data.
         tokio::fs::write(&enc_path, b"not-valid-encrypted-data-at-all-1234567890")
             .await
             .unwrap();
 
-        // Write valid plaintext credentials.
         let plain_json = r#"{
             "client_id": "fallback_id",
             "client_secret": "fallback_secret",
@@ -880,20 +883,9 @@ mod tests {
         }"#;
         tokio::fs::write(&plain_path, plain_json).await.unwrap();
 
-        let res = load_credentials_inner(None, &enc_path, &plain_path)
-            .await
-            .unwrap();
-
-        match res {
-            Credential::AuthorizedUser(secret) => {
-                assert_eq!(
-                    secret.client_id, "fallback_id",
-                    "Should fall through to plaintext credentials"
-                );
-            }
-            _ => panic!("Expected AuthorizedUser from plaintext fallback"),
-        }
-        assert!(!enc_path.exists(), "Stale credentials.enc must be removed");
+        let res = load_credentials_inner(None, &enc_path, &plain_path).await;
+        assert!(res.is_err(), "must not fall back to plaintext credentials");
+        assert!(enc_path.exists());
     }
 
     #[tokio::test]

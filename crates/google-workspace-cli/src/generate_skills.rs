@@ -101,6 +101,18 @@ pub async fn handle_generate_skills(args: &[String]) -> Result<(), GwsError> {
         });
     }
 
+    if filter
+        .as_ref()
+        .is_none_or(|f| "accounts".contains(f.as_str()))
+    {
+        generate_accounts_skill(output_path)?;
+        index.push(SkillIndexEntry {
+            name: "gws-accounts".to_string(),
+            description: ACCOUNTS_SKILL_DESCRIPTION.to_string(),
+            category: "service".to_string(),
+        });
+    }
+
     for entry in services::SERVICES {
         let alias = entry.aliases[0];
 
@@ -704,6 +716,13 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
 | `--format <FORMAT>` | Output format: `json` (default), `table`, `yaml`, `csv` |
 | `--dry-run` | Validate locally without calling the API |
 | `--sanitize <TEMPLATE>` | Screen responses through Model Armor |
+| `--account <EMAIL>` | Run as this configured account (see `gws auth list`) |
+
+## Multiple Accounts
+
+Several Google accounts can be configured. Commands that change data must name
+one with `--account EMAIL` when more than one exists. Read
+`../gws-accounts/SKILL.md` before acting on a user's behalf.
 
 ## CLI Syntax
 
@@ -755,6 +774,85 @@ gws <service> <resource> [sub-resource] <method> [flags]
     .replace("__VERSION__", env!("CARGO_PKG_VERSION"));
 
     write_skill(base, "gws-shared", &content)
+}
+
+const ACCOUNTS_SKILL_DESCRIPTION: &str =
+    "gws CLI: Choosing the right Google account when several are configured.";
+
+fn generate_accounts_skill(base: &Path) -> Result<(), GwsError> {
+    let content = r#"---
+name: gws-accounts
+description: "__DESCRIPTION__"
+metadata:
+  version: __VERSION__
+  openclaw:
+    category: "productivity"
+    requires:
+      bins:
+        - gws
+---
+
+# gws: Multiple Accounts
+
+> **PREREQUISITE:** Read `../gws-shared/SKILL.md` for auth, global flags, and security rules.
+
+`gws` can hold credentials for several Google accounts. Each command runs as
+exactly one of them.
+
+## Rules
+
+1. Run `gws auth list` first to see the configured accounts and the default.
+2. Pass `--account EMAIL` on every command that changes data (send, create,
+   update, delete, share). With more than one account configured, gws refuses
+   such commands without it.
+3. Never guess the account. If the user's request doesn't make it clear, ask.
+4. Reads may omit `--account`; they use the default account, and gws prints
+   `gws: using default account EMAIL` on stderr when it does.
+5. To work across accounts (e.g. check two inboxes), run one command per
+   account. There is no multi-account fan-out.
+
+## Selecting an account
+
+```bash
+gws auth list                                        # accounts + default
+gws --account me@work.com gmail +triage              # flag, anywhere in argv
+GOOGLE_WORKSPACE_CLI_ACCOUNT=me@work.com gws drive files list
+```
+
+The flag overrides `GOOGLE_WORKSPACE_CLI_ACCOUNT`, which overrides the default.
+Matching is exact and case-insensitive.
+
+## Errors
+
+Account errors come back as JSON with exit code 3. `error.accounts` lists the
+configured emails, so retry with one of them:
+
+| `error.reason` | Meaning |
+|---|---|
+| `accountRequired` | A write (or a read with no default) needs `--account` |
+| `unknownAccount` | The email isn't configured |
+| `accountConflict` | `--account` was combined with `GOOGLE_WORKSPACE_CLI_TOKEN` or `..._CREDENTIALS_FILE` |
+| `noAccountRegistry` | This config directory has a single, unnamed account |
+| `accountMismatch` | `auth login --account X` signed in to a different Google account |
+
+## Managing accounts
+
+```bash
+gws auth login --account me@work.com                 # add, or add scopes to, an account
+gws auth login --account me@work.com --client-secret ./org_client.json
+gws auth default me@work.com                         # default for reads
+gws auth status --account me@work.com
+gws auth logout --account me@work.com [--revoke]
+gws auth import --from ~/.config/gws-old [--keyring-backend file]
+```
+
+Logging in again to an existing account adds the new scopes to the ones it
+already has.
+"#
+    .replace("__DESCRIPTION__", ACCOUNTS_SKILL_DESCRIPTION)
+    .replace("__VERSION__", env!("CARGO_PKG_VERSION"));
+
+    write_skill(base, "gws-accounts", &content)
 }
 
 fn render_persona_skill(persona: &PersonaEntry) -> String {
