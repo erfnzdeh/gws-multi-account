@@ -867,6 +867,9 @@ mod tests {
     async fn test_load_credentials_corrupt_encrypted_does_not_fall_through_to_plaintext() {
         // A corrupt credentials.enc must not silently switch to another
         // credential source, which could be a different identity.
+        // Isolate HOME so the test key is never written to the real config dir.
+        let tmp = tempfile::tempdir().unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", tmp.path());
         let dir = tempfile::tempdir().unwrap();
         let enc_path = dir.path().join("credentials.enc");
         let plain_path = dir.path().join("credentials.json");
