@@ -68,7 +68,8 @@ The repository is a Cargo workspace with two crates:
 | `main.rs`           | Entrypoint, two-phase CLI parsing, method resolution                     |
 | `auth.rs`           | OAuth2 token acquisition via env vars, encrypted credentials, or ADC     |
 | `credential_store.rs` | AES-256-GCM encryption/decryption of credential files                  |
-| `auth_commands.rs`  | `gws auth` subcommands: `login`, `logout`, `setup`, `status`, `export`   |
+| `accounts.rs`       | Account registry, `--account` selection, read/write classification       |
+| `auth_commands.rs`  | `gws auth` subcommands: `login`, `logout`, `setup`, `status`, `export`, `list`, `default`, `import` |
 | `commands.rs`       | Recursive `clap::Command` builder from Discovery resources               |
 | `executor.rs`       | HTTP request construction, response handling, schema validation          |
 | `schema.rs`         | `gws schema` command — introspect API method schemas                     |

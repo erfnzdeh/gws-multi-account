@@ -33,6 +33,13 @@ export GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json
 | `--format <FORMAT>` | Output format: `json` (default), `table`, `yaml`, `csv` |
 | `--dry-run` | Validate locally without calling the API |
 | `--sanitize <TEMPLATE>` | Screen responses through Model Armor |
+| `--account <EMAIL>` | Run as this configured account (see `gws auth list`) |
+
+## Multiple Accounts
+
+Several Google accounts can be configured. Commands that change data must name
+one with `--account EMAIL` when more than one exists. Read
+`../gws-accounts/SKILL.md` before acting on a user's behalf.
 
 ## CLI Syntax
 

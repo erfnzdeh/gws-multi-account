@@ -215,6 +215,55 @@ export GOOGLE_WORKSPACE_CLI_TOKEN=$(gcloud auth print-access-token)
 
 Environment variables can also live in a `.env` file.
 
+### Multiple accounts
+
+`gws` can hold credentials for several Google accounts. Each command runs as
+exactly one of them, chosen by `--account EMAIL` (accepted anywhere on the
+command line), then `GOOGLE_WORKSPACE_CLI_ACCOUNT`, then the default account.
+
+```bash
+gws auth login --account me@gmail.com      # the first account becomes the default
+gws auth login --account me@work.com       # pre-selects it in the browser
+gws auth list                              # JSON: accounts and the default
+gws auth default me@work.com
+
+gws --account me@work.com gmail +triage
+gws calendar +agenda                       # reads use the default account
+```
+
+Rules, designed so agents can't act as the wrong account by accident:
+
+- **Writes must name an account.** With two or more accounts configured, a
+  command that changes data (any method that isn't a GET and doesn't accept a
+  `.readonly` scope, or a writing helper such as `+send`) fails with
+  `"reason": "accountRequired"` unless `--account` or
+  `GOOGLE_WORKSPACE_CLI_ACCOUNT` is set. The error lists the configured
+  accounts. `--dry-run` is exempt.
+- **Reads fall back to the default**, with a `gws: using default account ...`
+  note on stderr. Stdout is unchanged.
+- **No fallbacks between identities.** An unknown account is an error, and so
+  is combining `--account` with `GOOGLE_WORKSPACE_CLI_TOKEN` or
+  `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE`.
+- **Logging in again adds scopes** (incremental auth) instead of replacing
+  them. If the browser returns a different account than `--account`, nothing
+  is saved.
+- **Per-account OAuth clients.** `gws auth login --account me@work.com
+  --client-secret ./client.json` pins a client to one account, for Workspace
+  orgs that block external apps. Everyone else shares `client_secret.json`.
+- `gws auth logout --account X` deletes that account locally; add `--revoke`
+  to also revoke its refresh token at Google.
+
+Accounts live in `~/.config/gws/accounts.toml` and
+`~/.config/gws/accounts/<email>/` (credentials, token cache, timezone cache),
+all encrypted with the same key. A config directory without `accounts.toml`
+keeps working as a single-account directory, exactly as before. To move such a
+directory's account into the registry:
+
+```bash
+gws auth import --from ~/.config/gws                          # this directory, in place
+gws auth import --from ~/.config/gws-work --keyring-backend file
+```
+
 ## AI Agent Skills
 
 The repo ships 100+ Agent Skills (`SKILL.md` files) — one for every supported API, plus higher-level helpers for common workflows and 50 curated recipes for Gmail, Drive, Docs, Calendar, and Sheets. See the full [Skills Index](docs/skills.md) for the complete list.
@@ -379,6 +428,7 @@ All variables are optional. See [`.env.example`](.env.example) for a copy-paste 
 |---|---|
 | `GOOGLE_WORKSPACE_CLI_TOKEN` | Pre-obtained OAuth2 access token (highest priority) |
 | `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` | Path to OAuth credentials JSON (user or service account) |
+| `GOOGLE_WORKSPACE_CLI_ACCOUNT` | Account to use when `--account` is not given (see [Multiple accounts](#multiple-accounts)) |
 | `GOOGLE_WORKSPACE_CLI_CLIENT_ID` | OAuth client ID (alternative to `client_secret.json`) |
 | `GOOGLE_WORKSPACE_CLI_CLIENT_SECRET` | OAuth client secret (paired with `CLIENT_ID`) |
 | `GOOGLE_WORKSPACE_CLI_CONFIG_DIR` | Override config directory (default: `~/.config/gws`) |

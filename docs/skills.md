@@ -9,6 +9,7 @@ Core Google Workspace API skills.
 | Skill | Description |
 |-------|-------------|
 | [gws-shared](../skills/gws-shared/SKILL.md) | gws CLI: Shared patterns for authentication, global flags, and output formatting. |
+| [gws-accounts](../skills/gws-accounts/SKILL.md) | gws CLI: Choosing the right Google account when several are configured. |
 | [gws-drive](../skills/gws-drive/SKILL.md) | Google Drive: Manage files, folders, and shared drives. |
 | [gws-sheets](../skills/gws-sheets/SKILL.md) | Google Sheets: Read and write spreadsheets. |
 | [gws-gmail](../skills/gws-gmail/SKILL.md) | Gmail: Send, read, and manage email. |
