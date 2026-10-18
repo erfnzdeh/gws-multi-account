@@ -80,12 +80,14 @@ From a local clone, use `cargo install --path crates/google-workspace-cli --lock
 
 ```bash
 which -a gws
-gws --version
+gws auth list
 ```
 
-The version line must end in `(my-gws)`, for example `gws 0.22.5 (my-gws)`. Upstream prints
-the same version number without that suffix, so the number alone tells you nothing. If
-`which -a gws` lists more than one path, the first one wins. Remove any upstream copies:
+The fork replaces upstream `gws` completely: same binary name, same `gws --version` output,
+same config directory. So `--version` can't tell them apart. `gws auth list` can: the fork
+prints JSON with an `"accounts"` field (an empty list before your first login), while
+upstream has no `auth list` command and fails. If `which -a gws` lists more than one path,
+the first one wins. Remove any upstream copies:
 
 ```bash
 npm uninstall -g @googleworkspace/cli
@@ -132,8 +134,9 @@ earlier agents actually made. Read them before you start.
 - Don't install `@googleworkspace/cli` from npm, the Homebrew formula, the upstream GitHub
   releases or the upstream Nix flake. They are all upstream `gws` without multi-account
   support. Use the `cargo install --git` command [above](#2-build-and-install-the-fork).
-- Check `gws --version` for `(my-gws)`, not just `which gws`. An old upstream binary earlier
-  on `PATH` is the most common problem.
+- Run `gws auth list` to confirm the installed `gws` is the fork (it prints JSON with an
+  `"accounts"` field). `gws --version` prints the same thing for the fork and upstream, so
+  it proves nothing. An old upstream binary earlier on `PATH` is the most common problem.
 - Don't guess a package name for `cargo install`. The plain command above is correct.
 - Building and logging in need the user: the OAuth consent screen opens in their browser,
   and macOS may show a Keychain prompt that only a person can approve. Tell them what to
@@ -663,8 +666,8 @@ If a required Google API is not enabled for your GCP project, you will see a
 
 ### `--account` is not recognized
 
-You are running upstream `gws`, not this fork. Check `which -a gws` and `gws --version` (the
-fork prints `(my-gws)`), then remove or shadow the other copy. See
+You are running upstream `gws`, not this fork. Check `which -a gws` and `gws auth list`
+(only the fork has `auth list`), then remove or shadow the other copy. See
 [Make sure gws is the fork](#3-make-sure-gws-is-the-fork).
 
 ### `accountRequired`

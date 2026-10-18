@@ -109,7 +109,7 @@ async fn run() -> Result<(), GwsError> {
     }
 
     if is_version_flag(&first_arg) {
-        println!("gws {} (my-gws)", env!("CARGO_PKG_VERSION"));
+        println!("gws {}", env!("CARGO_PKG_VERSION"));
         println!("This is not an officially supported Google product.");
         return Ok(());
     }
